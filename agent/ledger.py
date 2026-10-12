@@ -37,12 +37,79 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_REQUIRED_FIELDS = {
+    "ts", "agent_id", "run_id", "tool", "args_hash", "classification",
+    "decision", "reason",
+}
+
+
+def _digest(entry: dict) -> str:
+    # Keep this serialization exactly aligned with the lab contract so an
+    # independent verifier can reproduce the digest.
+    payload = json.dumps(entry, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    missing = _REQUIRED_FIELDS.difference(entry)
+    if missing:
+        raise ValueError(f"ledger entry missing fields: {', '.join(sorted(missing))}")
+
+    previous_hash = "0" * 64
+    if path.exists():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                previous_hash = str(json.loads(lines[-1])["hash"])
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ValueError("cannot append to a malformed ledger") from exc
+
+    record = dict(entry)
+    record.pop("hash", None)
+    record["prev_hash"] = previous_hash
+    record["hash"] = _digest(record)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Force LF even on Windows so staged JSONL evidence does not contain CR
+    # characters that `git diff --check` reports as trailing whitespace.
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    expected_previous = "0" * 64
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    for line in lines:
+        if not line.strip():
+            return False
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(record, dict) or not str(record.get("reason", "")).strip():
+            return False
+        if _REQUIRED_FIELDS.difference(record) or record.get("prev_hash") != expected_previous:
+            return False
+        stored_hash = record.get("hash")
+        if not isinstance(stored_hash, str):
+            return False
+        unhashed = dict(record)
+        unhashed.pop("hash", None)
+        if _digest(unhashed) != stored_hash:
+            return False
+        expected_previous = stored_hash
+    return True

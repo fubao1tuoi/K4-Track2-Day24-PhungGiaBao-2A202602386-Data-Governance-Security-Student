@@ -30,10 +30,74 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+import unicodedata
+
+
+_EMAIL_RE = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+(?![\w-])",
+    re.I,
+)
+_NUMBER_RE = re.compile(r"(?<!\d)\d{8,16}(?!\d)")
+_FORMATTED_PHONE_RE = re.compile(r"(?<!\d)0\d(?:[ .-]?\d){8,9}(?!\d)")
+
+
+def _plain(text: str) -> str:
+    """Normalize labels only; offsets always come from the original text."""
+    normalized = unicodedata.normalize("NFKD", text.lower().replace("đ", "d"))
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _add(entities: list[dict], entity_type: str, start: int, end: int) -> None:
+    """Add a span unless it overlaps a higher-priority span already found."""
+    if any(start < item["end"] and item["start"] < end for item in entities):
+        return
+    entities.append({"type": entity_type, "start": start, "end": end})
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+
+    entities: list[dict] = []
+    normalized = _plain(text)
+
+    # Email is structurally unambiguous and gets first priority.
+    for match in _EMAIL_RE.finditer(text):
+        _add(entities, "EMAIL", match.start(), match.end())
+
+    # Vietnamese numeric identifiers overlap heavily.  Classify them using
+    # nearby labels instead of reporting the same digits as several PII types.
+    for match in _NUMBER_RE.finditer(text):
+        start, end = match.span()
+        prefix = normalized[max(0, start - 64):start]
+        value = match.group()
+        if re.search(r"(?:stk|so tai khoan)\s*[:#-]?\s*$", prefix):
+            _add(entities, "VN_BANK_ACCOUNT", start, end)
+        elif re.search(r"cccd(?:\s+cua\s+[^:]{0,40})?\s*[:#-]?\s*$", prefix):
+            if len(value) == 12:
+                _add(entities, "VN_CCCD", start, end)
+        elif value.startswith("0") and len(value) in (10, 11) and re.search(
+            r"(?:sdt|so dien thoai|dien thoai)(?:\s+[^:]{0,40})?\s*[:#-]?\s*$",
+            prefix,
+        ):
+            _add(entities, "VN_PHONE", start, end)
+
+    # Also support phone numbers containing spaces, dots or hyphens.
+    for match in _FORMATTED_PHONE_RE.finditer(text):
+        digits = re.sub(r"\D", "", match.group())
+        if len(digits) not in (10, 11):
+            continue
+        prefix = normalized[max(0, match.start() - 64):match.start()]
+        if re.search(r"(?:sdt|so dien thoai|dien thoai)(?:\s+[^:]{0,40})?\s*[:#-]?\s*$", prefix):
+            _add(entities, "VN_PHONE", match.start(), match.end())
+
+    return sorted(entities, key=lambda item: (item["start"], item["end"], item["type"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        redacted = redacted[:entity["start"]] + replacement + redacted[entity["end"]:]
+    return redacted

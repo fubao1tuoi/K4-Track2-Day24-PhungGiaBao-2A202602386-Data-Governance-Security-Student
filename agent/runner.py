@@ -59,16 +59,174 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
-class RunnerScaffoldPending(NotImplementedError):
-    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
+BASE_DIR = Path(__file__).resolve().parent.parent
+CUSTOMERS_FILE = BASE_DIR / "data" / "customers.json"
+AGENT_ID = "lab24-agent"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(timestamp: datetime) -> str:
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _args_hash(arguments: object) -> str:
+    encoded = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _authorize_and_log(
+    *, ledger_path: Path, run_id: str, tool: str, arguments: object,
+    classification: str, purpose: str, principal_id: str,
+    agent_scopes: tuple[str, ...], parent_scopes: tuple[str, ...],
+    delegation_depth: int, egress_enabled: bool, expires_at: str,
+) -> bool:
+    context = policy.PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=f"{AGENT_ID}/{run_id}",
+        delegation_depth=delegation_depth,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=tool,
+        agent_scopes=agent_scopes,
+        parent_scopes=parent_scopes,
+        expires_at=expires_at,
+    )
+    allowed, reason = policy.check(context)
+    ledger.append(
+        {
+            "ts": _iso(_utc_now()),
+            "agent_id": AGENT_ID,
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _args_hash(arguments),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+        },
+        ledger_path,
+    )
+    return allowed
+
+
+def _ticket_ids(docs: list[dict]) -> list[int]:
+    """Derive typed IDs only from trusted filenames, never document text."""
+    result: set[int] = set()
+    for doc in docs:
+        match = re.fullmatch(r"ticket-(\d+)(?:[a-z]+)?\.md", str(doc.get("id", "")), re.I)
+        if match:
+            result.add(int(match.group(1)))
+    return sorted(result)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    records = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    wanted = set(ticket_ids)
+    return sorted({
+        str(record["customer_id"])
+        for record in records
+        if wanted.intersection(record.get("related_tickets", []))
+    })
 
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    expires_at = _iso(_utc_now() + timedelta(minutes=5))
+    invocation = uuid.uuid4().hex
+    run_a = f"{invocation}-run-a"
+    run_b = f"{invocation}-run-b"
+
+    # Run A owns untrusted content but has neither private-store nor egress scope.
+    search_allowed = _authorize_and_log(
+        ledger_path=ledger_path,
+        run_id=run_a,
+        tool="search_docs",
+        arguments={"query": message},
+        classification="internal",
+        purpose="summarize-tickets",
+        principal_id=principal_id,
+        agent_scopes=("search_docs",),
+        parent_scopes=(),
+        delegation_depth=0,
+        egress_enabled=False,
+        expires_at=expires_at,
+    )
+    docs = tools.search_docs(message) if search_allowed else []
+    ticket_ids = _ticket_ids(docs)
+
+    # Detection is observability only.  No customer ID or free text returned
+    # by the model crosses into Run B.
+    combined_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
+    injected = llm.find_injection(combined_text) if combined_text else None
+
+    # Run B receives only typed ticket IDs and maps them through trusted
+    # related_tickets metadata.  Delegation cannot exceed the principal's
+    # parent scope.
+    principal_tools = {
+        "support_l1": ("search_docs",),
+        "billing": ("search_docs", "read_customer"),
+        "dpo": ("search_docs", "read_customer"),
+    }.get(principal_id, ())
+    for customer_id in _customers_for_tickets(ticket_ids):
+        read_allowed = _authorize_and_log(
+            ledger_path=ledger_path,
+            run_id=run_b,
+            tool="read_customer",
+            arguments={"customer_id": customer_id},
+            classification="restricted",
+            purpose="support-reply",
+            principal_id=principal_id,
+            agent_scopes=("read_customer",),
+            parent_scopes=principal_tools,
+            delegation_depth=1,
+            egress_enabled=False,
+            expires_at=expires_at,
+        )
+        if read_allowed:
+            tools.read_customer(customer_id)
+
+    # A detected lure causes an attempted policy decision, never a direct
+    # network call.  Restricted + egress is denied even for DPO.
+    if injected is not None:
+        _authorize_and_log(
+            ledger_path=ledger_path,
+            run_id=run_b,
+            tool="http_post",
+            arguments={"url": injected.target_url, "ticket_ids": ticket_ids},
+            classification="restricted",
+            purpose="support-reply",
+            principal_id=principal_id,
+            agent_scopes=("http_post",),
+            parent_scopes=principal_tools,
+            delegation_depth=1,
+            egress_enabled=True,
+            expires_at=expires_at,
+        )
+
+    # The summarizer receives the same document identities but never raw PII.
+    # Injection detection above stays inside Run A; only typed ticket IDs cross
+    # into Run B.
+    sanitized_docs = [
+        {**doc, "text": pii.redact(str(doc.get("text", "")))}
+        for doc in docs
+    ]
+    return llm.summarize(sanitized_docs)
